@@ -332,18 +332,117 @@ TEST_F(ObjectPoolTest, DISABLED_BenchmarkMultiThreaded) {
 // Edge Cases and Error Handling
 // ============================================================================
 
+TEST_F(ObjectPoolTest, TryAllocateBasic) {
+    slick::ObjectPool<SimpleStruct> pool(256);
+
+    SimpleStruct* obj = pool.try_allocate();
+    ASSERT_NE(obj, nullptr);
+
+    obj->id = 42;
+    obj->value = 3.14;
+
+    EXPECT_EQ(obj->id, 42);
+    EXPECT_DOUBLE_EQ(obj->value, 3.14);
+
+    pool.free(obj);
+}
+
+TEST_F(ObjectPoolTest, TryAllocateReturnsNullOnExhaustion) {
+    constexpr size_t POOL_SIZE = 64;
+    slick::ObjectPool<SimpleStruct> pool(POOL_SIZE);
+
+    std::vector<SimpleStruct*> objects;
+
+    for (size_t i = 0; i < POOL_SIZE; ++i) {
+        SimpleStruct* obj = pool.try_allocate();
+        ASSERT_NE(obj, nullptr);
+        obj->id = static_cast<int32_t>(i);
+        objects.push_back(obj);
+    }
+
+    SimpleStruct* obj = pool.try_allocate();
+    EXPECT_EQ(obj, nullptr);
+
+    for (auto* o : objects) {
+        pool.free(o);
+    }
+}
+
+TEST_F(ObjectPoolTest, TryAllocateVsAllocate) {
+    constexpr size_t POOL_SIZE = 64;
+    slick::ObjectPool<SimpleStruct> pool(POOL_SIZE);
+
+    std::vector<SimpleStruct*> objects;
+
+    for (size_t i = 0; i < POOL_SIZE; ++i) {
+        SimpleStruct* obj = pool.try_allocate();
+        ASSERT_NE(obj, nullptr);
+        objects.push_back(obj);
+    }
+
+    SimpleStruct* try_obj = pool.try_allocate();
+    EXPECT_EQ(try_obj, nullptr);
+
+    SimpleStruct* alloc_obj = pool.allocate();
+    ASSERT_NE(alloc_obj, nullptr);
+
+    objects.push_back(alloc_obj);
+
+    for (auto* o : objects) {
+        pool.free(o);
+    }
+}
+
+TEST_F(ObjectPoolTest, TryAllocateMultiThreaded) {
+    constexpr size_t POOL_SIZE = 512;
+    constexpr int NUM_THREADS = 8;
+    constexpr int OPS_PER_THREAD = 500;
+
+    slick::ObjectPool<SimpleStruct> pool(POOL_SIZE);
+    std::atomic<int> null_count{0};
+    std::atomic<int> success_count{0};
+
+    auto worker = [&](int) {
+        std::vector<SimpleStruct*> local_objects;
+        local_objects.reserve(OPS_PER_THREAD);
+
+        for (int i = 0; i < OPS_PER_THREAD; ++i) {
+            SimpleStruct* obj = pool.try_allocate();
+            if (obj) {
+                obj->id = i;
+                success_count++;
+                local_objects.push_back(obj);
+            } else {
+                null_count++;
+            }
+        }
+
+        for (auto* obj : local_objects) {
+            pool.free(obj);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        threads.emplace_back(worker, i);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_GT(success_count.load(), 0);
+}
+
 TEST_F(ObjectPoolTest, NullPointerHandling) {
     slick::ObjectPool<SimpleStruct> pool(256);
 
-    // free_object should handle null gracefully (though not officially supported)
-    // This test verifies it doesn't crash
+    pool.free(nullptr);
+
     SimpleStruct* external = new SimpleStruct();
     external->id = 999;
 
-    // Free object not from pool (should delete it)
     pool.free(external);
-
-    // Don't access external after this point - it's been deleted
 }
 
 TEST_F(ObjectPoolTest, AlignmentTest) {

@@ -1,6 +1,6 @@
 # slick-object-pool
 
-[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
 [![Header-only](https://img.shields.io/badge/header--only-yes-brightgreen.svg)](#installation)
@@ -8,7 +8,7 @@
 [![CI](https://github.com/SlickQuant/slick-object-pool/actions/workflows/ci.yml/badge.svg)](https://github.com/SlickQuant/slick-object-pool/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/SlickQuant/slick-object-pool)](https://github.com/SlickQuant/slick-object-pool/releases)
 
-A high-performance, lock-free object pool for C++20 with multi-threading support. Designed for real-time systems, game engines, high-frequency trading, and any application requiring predictable, low-latency object allocation.
+A high-performance, lock-free object pool for C++17 with multi-threading support. Designed for real-time systems, game engines, high-frequency trading, and any application requiring predictable, low-latency object allocation.
 
 ## Table of Contents
 
@@ -68,7 +68,7 @@ A high-performance, lock-free object pool for C++20 with multi-threading support
 
 ### 🔧 Architecture
 - **Header-only** - Single file integration, no build dependencies
-- **C++20 compliant** - Modern C++ with compile-time safety guarantees
+- **C++17 compliant** - Modern C++ with compile-time safety guarantees
 - **Type-safe** - Static assertions ensure compatible types
 - **Cross-platform** - Windows, Linux, macOS, and Unix-like systems
 
@@ -248,8 +248,8 @@ int main() {
 
 The pool uses atomic compare-and-swap (CAS) operations to coordinate multiple producers and consumers without locks:
 
-- **Producers** (threads calling `allocate()`) atomically reserve slots from the pool
-- **Consumers** (threads calling `free()`) atomically return objects to the pool
+- **Producers** (threads calling `free()`) atomically return objects to the pool
+- **Consumers** (threads calling `allocate()`) atomically reserve slots from the pool
 - **Ring buffer** wrapping is handled atomically without blocking
 - **No spinlocks, no mutexes** - truly wait-free for successful operations
 
@@ -258,12 +258,13 @@ The pool uses atomic compare-and-swap (CAS) operations to coordinate multiple pr
 The implementation is optimized to prevent false sharing on modern CPUs:
 
 ```
-Cache Line 0 (64 bytes) - Producer owned:
-  ├─ reserved_  (atomic counter for producers)
-  └─ size_      (pool size)
+Cache Line 0 (configurable, default 64 / 32 for ARM Cortex-A9) - Producer owned:
+  ├─ reserved_index_  (atomic counter for producers)
+  └─ padding
 
-Cache Line 1 (64 bytes) - Consumer owned:
-  └─ consumed_  (atomic counter for consumers)
+Cache Line 1 (configurable) - Consumer owned:
+  ├─ consumed_  (atomic counter for consumers)
+  └─ padding
 
 Cache Lines 2+ - Shared data:
   ├─ control_       (slot metadata)
@@ -281,9 +282,9 @@ Cache Lines 2+ - Shared data:
 ```
 ObjectPool instance
   ├─ Heap: buffer_[size_]       (actual objects)
-  ├─ Heap: control_[size_]      (slot metadata)
-  ├─ Heap: free_objects_[size_] (free list)
-  └─ Stack: reserved_, consumed_ (atomics)
+  ├─ Heap: control_[size_]      (slot metadata, 8 bytes per slot)
+  ├─ Heap: free_objects_[size_] (free object pointers)
+  └─ Inline: reserved_index_, consumed_ (cache-line-isolated atomics)
 ```
 
 ## Performance
@@ -333,6 +334,12 @@ T* allocate();
 Returns a pointer to an object from the pool. If pool is exhausted, allocates a new object from heap.
 
 ```cpp
+// Try to allocate without heap fallback (preferred for embedded/real-time)
+T* try_allocate() noexcept;
+```
+Returns a pointer to an object from the pool, or nullptr if pool is exhausted. No heap allocation.
+
+```cpp
 // Return an object to the pool
 void free(T* obj);
 ```
@@ -340,7 +347,7 @@ Returns an object to the pool if it belongs to the pool, otherwise deletes it.
 
 ```cpp
 // Query method
-constexpr uint32_t size() const noexcept;  // Pool size
+uint32_t size() const noexcept;  // Pool size
 ```
 
 ### Type Requirements
@@ -374,11 +381,11 @@ static_assert(std::is_default_constructible_v<T>);
 
 ## Requirements
 
-- **C++ Standard:** C++20 or later
+- **C++ Standard:** C++17 or later
 - **Compiler:**
-  - GCC 10+
-  - Clang 11+
-  - MSVC 2019 16.8+
+  - GCC 8+
+  - Clang 7+
+  - MSVC 2017 15.7+
 - **Dependencies:**
   - Standard library only
 - **OS:** Windows, Linux, macOS, or POSIX-compliant system
@@ -393,7 +400,7 @@ target_link_libraries(your_target PRIVATE slick::object-pool rt atomic)
 
 Or with command line:
 ```bash
-g++ -std=c++20 your_app.cpp -lrt -latomic -o your_app
+g++ -std=c++17 your_app.cpp -lrt -latomic -o your_app
 ```
 
 ## Building
@@ -474,7 +481,7 @@ sudo cmake --install .
 
 ### Memory Ordering
 
-The implementation uses C++20 atomic memory ordering:
+The implementation uses C++17 atomic memory ordering:
 - **acquire-release** for synchronization between threads
 - **relaxed** for performance where ordering isn't required
 
@@ -504,8 +511,16 @@ slick::ObjectPool<T> pool(1000);
 // When pool is exhausted, allocate() allocates from heap
 T* obj = pool.allocate();  // May return heap-allocated object
 
-// free_object() detects and handles both cases
+// free() detects and handles both cases
 pool.free(obj);  // Works for pool or heap objects
+
+// For embedded/real-time: use try_allocate() to avoid heap
+if (auto* obj = pool.try_allocate()) {
+    // Use obj
+    pool.free(obj);
+} else {
+    // Handle pool exhaustion (drop, wait, etc.)
+}
 ```
 
 ### Type Design
@@ -555,7 +570,7 @@ A: `allocate()` automatically allocates from heap. `free()` detects and deletes 
 A: Yes! The pool works with any default constructible type, including std::string, std::vector, and other standard containers.
 
 **Q: Is the pool real-time safe?**
-A: Operations are lock-free but not wait-free. Allocation may fail and fall back to heap allocation.
+A: `try_allocate()` is lock-free and never falls back to heap, making it suitable for real-time use. `allocate()` may fall back to heap allocation. Operations are lock-free but not wait-free under high contention.
 
 ## Contributing
 

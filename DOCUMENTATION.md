@@ -21,12 +21,10 @@ The code uses **Doxygen-style** documentation comments for automatic API documen
 | `@throws` | Exception specification | When exceptions are thrown |
 | `@note` | Important note | Additional information |
 | `@warning` | Warning | Critical warnings |
-| `@pre` | Precondition | Requirements before calling |
 | `@post` | Postcondition | State after calling |
 | `@par` | Paragraph heading | Subsection headers |
 | `@code/@endcode` | Code example | Inline code examples |
 | `@section` | Documentation section | Major sections |
-| `///` | Inline comment | Member variable docs |
 
 ## Documentation Coverage
 
@@ -38,6 +36,7 @@ Includes:
 - Memory layout diagram
 - Type requirements
 - Thread safety guarantees
+- ARM32-specific notes
 - Usage examples
 - Author and version information
 
@@ -47,10 +46,20 @@ Includes:
 
 Comprehensive documentation covering:
 - Purpose and design
-- Template type requirements
+- Template type requirements (`T` must be default constructible)
+- Cache line size template parameter (`CacheLineSize`, default 64, use 32 for ARM Cortex-A9)
+- Platform requirements (64-bit atomics must be lock-free)
 - Thread safety model
-- Performance characteristics
 - Example usage patterns
+
+### Static Assertions
+
+| Assertion | Purpose |
+|-----------|---------|
+| `std::is_default_constructible_v<T>` | T must have a default constructor |
+| `std::atomic<uint64_t>::is_always_lock_free` | 64-bit atomics must be lock-free (ARMv7-a requires LDREXD/STREXD) |
+| `CacheLineSize > 0 && power of 2` | Cache line size must be a valid power of 2 |
+| `CacheLineSize >= alignof(std::max_align_t)` | Cache line size must respect max alignment |
 
 ### Public API Documentation
 
@@ -58,79 +67,93 @@ Comprehensive documentation covering:
 
 1. **ObjectPool(uint32_t size)**
    - Full parameter documentation
-   - Exception specifications
-   - Preconditions and postconditions
+   - Exception specifications (`std::invalid_argument` for non-power-of-2 size)
+   - Postconditions
    - Usage examples
+   - Exception-safe: validates size before allocating memory
+   - If allocation fails (`bad_alloc`), previously allocated memory is properly freed
 
 #### Destructor
 
-- Cleanup behavior documentation
-- Important warnings
+- Cleanup behavior documentation (deletes buffer_, free_objects_, control_)
 
 #### Public Methods
 
-1. **uint32_t size() const**
-   - Pool size query
-   - Power-of-2 note
+1. **uint32_t size() const noexcept**
+   - Pool capacity query
+   - Returns the power-of-2 size passed to constructor
 
-2. **T* allocate()**
+2. **T\* allocate()**
    - Comprehensive documentation
-   - Behavior under different conditions
-   - Performance characteristics
-   - Thread safety guarantees
+   - Lock-free pool allocation with heap fallback
+   - Never returns nullptr
+   - Thread-safe
    - Usage examples
-   - Important warnings
 
-3. **void free(T* obj)**
-   - Dual behavior (pool vs heap)
-   - Automatic detection mechanism
-   - Performance notes
-   - Critical warnings
+3. **T\* try_allocate() noexcept**
+   - Lock-free pool allocation without heap fallback
+   - Returns nullptr when pool is exhausted
+   - Preferred for embedded/real-time systems
+   - Thread-safe
+   - Usage examples
 
-4. **void reset()**
-   - Purpose and use cases
-   - Thread safety warnings
-   - Testing vs production use
+4. **void free(T\* obj)**
+   - Dual behavior (pool vs heap objects)
+   - Automatic detection via address range check
+   - nullptr-safe (no-op for nullptr)
+   - Critical warnings (no double-free, no use-after-free)
+   - Thread-safe
+
+5. **void reset()**
+   - Purpose and use cases (testing, application reset)
+   - NOT THREAD-SAFE
+   - Invalidates all outstanding object references
+   - Exception-safe: allocates new control_ before deleting old
 
 ### Private Implementation Documentation
 
 #### Internal Methods
 
-1. **uint64_t reserve(uint32_t n)**
-   - Lock-free reservation mechanism
-   - Ring buffer wrapping
-   - Exception specification
+1. **uint64_t reserve()**
+   - Lock-free single-element reservation using CAS
+   - 3-tier backoff for contention
+   - Returns reserved index
 
-2. **operator[](uint64_t index)**
-   - Array access semantics
-   - Both const and non-const versions
+2. **void publish(uint64_t index) noexcept**
+   - Release-store to slot's data_index
+   - Synchronizes with consumer's acquire-load
 
-3. **void publish(uint64_t index, uint32_t n)**
-   - Synchronization mechanism
-   - Memory ordering notes
+3. **T\* consume() noexcept**
+   - Lock-free consumption using CAS
+   - Reads free_objects_ BEFORE CAS to prevent data race
+   - Returns nullptr when pool is empty
+   - 3-tier backoff for contention
 
-4. **std::pair<T*, uint32_t> consume()**
-   - Consumption logic
-   - Lock-free guarantees
-   - Return value meaning
+4. **static void spin_yield(unsigned& spin_count) noexcept**
+   - 3-tier backoff: spin → yield → sleep
+   - Documents non-RT Linux sleep_for(1us) behavior (actual 1-10ms)
 
 #### Member Variables
 
-All member variables are documented with inline comments (`///`):
-
-- **Configuration:** `size_`, `mask_`
-- **Storage:** `buffer_`, `lower_bound_`, `upper_bound_`, `free_objects_`
-- **Control:** `control_`, `reserved_`, `consumed_`
+| Variable | Type | Description |
+|----------|------|-------------|
+| `reserved_index_` | `atomic<uint64_t>` | Producer counter (cache-line isolated) |
+| `pad_reserved_` | `char[]` | Padding to prevent false sharing |
+| `consumed_` | `atomic<uint64_t>` | Consumer counter (cache-line isolated) |
+| `pad_consumed_` | `char[]` | Padding to prevent false sharing |
+| `size_` | `uint32_t` | Pool capacity (power of 2) |
+| `mask_` | `uint32_t` | Bitmask for index wrapping (size - 1) |
+| `buffer_` | `T*` | Pooled objects array |
+| `lower_bound_` | `uintptr_t` | Start address of buffer_ (for pool membership check) |
+| `upper_bound_` | `uintptr_t` | End address of buffer_ (for pool membership check) |
+| `free_objects_` | `T**` | Free object pointers ring buffer |
+| `control_` | `slot*` | Ring buffer slot metadata |
 
 #### Internal Structures
 
 1. **struct slot**
-   - Purpose and usage
-   - Member documentation
-
-2. **struct reserved_info**
-   - Producer coordination
-   - Field meanings
+   - `std::atomic<uint64_t> data_index` - Published index (INVALID_INDEX = unpublished)
+   - 8 bytes per slot (cache-efficient)
 
 ## Generating API Documentation
 
@@ -150,15 +173,15 @@ All member variables are documented with inline comments (`///`):
 
 2. **Create Doxyfile:**
    ```bash
-   cd d:\repo\slick-object-pool
+   cd /path/to/slick-object-pool
    doxygen -g
    ```
 
 3. **Configure Doxyfile:**
    ```
    PROJECT_NAME           = "slick-object-pool"
-   PROJECT_BRIEF          = "Lock-free object pool for C++20"
-   PROJECT_VERSION        = "0.1.0"
+   PROJECT_BRIEF          = "Lock-free object pool for C++17"
+   PROJECT_VERSION        = 0.2.0
    OUTPUT_DIRECTORY       = docs
    INPUT                  = include/slick
    RECURSIVE              = YES
@@ -191,15 +214,13 @@ All member variables are documented with inline comments (`///`):
 
 ### What's Documented
 
-✅ **All public APIs** - Complete parameter and return value docs
-✅ **Examples** - Working code examples for common use cases
-✅ **Thread safety** - Explicit guarantees and warnings
-✅ **Performance** - Expected performance characteristics
-✅ **Exceptions** - What exceptions are thrown and when
-✅ **Preconditions** - Requirements before calling
-✅ **Postconditions** - Expected state after calling
-✅ **Warnings** - Critical usage warnings
-✅ **Platform notes** - Platform-specific behavior
+- **All public APIs** - Complete parameter and return value docs
+- **Examples** - Working code examples for common use cases
+- **Thread safety** - Explicit guarantees and warnings
+- **Performance** - Expected performance characteristics
+- **Exceptions** - What exceptions are thrown and when
+- **Warnings** - Critical usage warnings
+- **Platform notes** - Platform-specific behavior (ARM32, non-RT Linux)
 
 ### Documentation Quality
 
@@ -210,7 +231,6 @@ All member variables are documented with inline comments (`///`):
 | Member variables | 100% |
 | Code examples | Extensive |
 | Thread safety | Explicit |
-| Performance notes | Detailed |
 | Platform specifics | Complete |
 
 ## Reading the Documentation
@@ -219,7 +239,7 @@ All member variables are documented with inline comments (`///`):
 
 Focus on:
 - Constructor documentation
-- `allocate()` and `free()` methods
+- `allocate()`, `try_allocate()`, and `free()` methods
 - Thread safety guarantees
 - Code examples
 - Warnings and notes
@@ -235,62 +255,10 @@ Additionally review:
 ### For Library Maintainers
 
 Full documentation including:
-- Implementation algorithms
-- Memory ordering semantics
-- Platform-specific details
+- Implementation algorithms (MPMC ring buffer with CAS)
+- Memory ordering semantics (acquire-release on data_index)
+- Platform-specific details (ARM32 LDREXD/STREXD, cache line sizes)
 - Performance characteristics
-
-## Documentation Examples
-
-### Well-Documented Function
-
-```cpp
-/**
- * @brief Allocate an object from the pool
- *
- * @details
- * Attempts to allocate an object from the pool using lock-free operations.
- * If the pool is exhausted, allocates a new object from the heap instead.
- *
- * This method is thread-safe and lock-free for multiple concurrent callers.
- *
- * @return Pointer to an object (never returns nullptr)
- *
- * @par Behavior
- * - Pool has available objects: Returns pooled object (fast path)
- * - Pool is exhausted: Allocates from heap (slower fallback)
- *
- * @par Performance
- * - Average: O(1) with low latency (~10-30ns typical)
- * - Worst case: O(number of concurrent allocators) due to CAS retry
- *
- * @par Thread Safety
- * Lock-free, safe for concurrent calls from multiple threads
- *
- * @par Example
- * @code
- * slick::ObjectPool<MyStruct> pool(1024);
- * MyStruct* obj = pool.allocate();
- * obj->field = value;
- * pool.free(obj);
- * @endcode
- *
- * @note Must be paired with free() to avoid memory leaks
- * @note Returned object is NOT automatically initialized
- */
-T* allocate();
-```
-
-### Key Elements
-
-1. **Brief** - One line summary
-2. **Details** - In-depth explanation
-3. **Return** - What it returns
-4. **Behavior** - Different scenarios
-5. **Performance** - Expected performance
-6. **Thread Safety** - Concurrency guarantees
-7. **Example** - Working code
-8. **Notes** - Important information
 
 ## Updating Documentation
 
@@ -321,11 +289,12 @@ When adding/modifying code:
 ## Related Documentation
 
 - **README.md** - User-facing documentation and examples
-- **CHANGES.md** - Migration guide and changelog
+- **REVIEW.md** - Code review and fix history
+- **TESTING.md** - Testing strategies and sanitizer usage
 - **Comments in code** - Implementation notes (not in public API docs)
 
 ---
 
-**Documentation Version:** 1.0
-**Last Updated:** 2025
+**Documentation Version:** 2.0
+**Last Updated:** 2026
 **Maintained By:** SlickQuant

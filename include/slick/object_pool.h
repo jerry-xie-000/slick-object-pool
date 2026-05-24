@@ -17,6 +17,10 @@
 #include <string>
 #include <cassert>
 #include <limits>
+#include <thread>
+#include <utility>
+#include <new>
+#include <chrono>
 
 namespace slick {
 
@@ -35,8 +39,8 @@ namespace slick {
  * @section memory_layout Memory Layout
  *
  * @code
- * [Cache Line 0: reserved_     Producer atomics (separate cache line)]
- * [Cache Line 1: consumed_     Consumer atomics (separate cache line)]
+ * [Cache Line 0: reserved_index_ Producer atomics (isolated cache line)]
+ * [Cache Line 1: consumed_      Consumer atomics (isolated cache line)]
  * [Heap:         control_      Ring buffer metadata]
  * [Heap:         buffer_       Pooled objects]
  * [Heap:         free_objects_ Free object pointers]
@@ -47,64 +51,88 @@ namespace slick {
  * - Multiple threads can call free() concurrently (lock-free)
  * - reset() is NOT thread-safe
  *
+ * @section arm_notes ARM32 Notes
+ * - On ARM Cortex-A9 (e.g. Zynq 7020), cache line size is 32 bytes.
+ *   Use CacheLineSize=32 template parameter for optimal alignment.
+ * - Requires ARMv7-a with LDREXD/STREXD for lock-free 64-bit atomics.
+ * - Spin loops include 3-tier backoff (spin/yield/sleep) for non-RT Linux kernels.
+ *
  * @section example Example Usage
  * @code
- * slick::ObjectPool<MyStruct> pool(1024);
+ * slick::ObjectPool<MyStruct, 32> pool(1024);
  * auto* obj = pool.allocate();
  * obj->field = value;
  * pool.free(obj);
  * @endcode
  *
  * @tparam T Object type to pool
+ * @tparam CacheLineSize Cache line size in bytes (default 64, use 32 for ARM Cortex-A9)
  *
  * @author SlickQuant
- * @version 0.0.1
+ * @version 0.2.0
  * @date 2025
  * @copyright MIT License
  */
-template<typename T>
+template<typename T, size_t CacheLineSize = 64>
 class ObjectPool {
-    // Type safety check: T must be default constructible
     static_assert(std::is_default_constructible_v<T>,
         "T must be default constructible");
+    static_assert(std::atomic<uint64_t>::is_always_lock_free,
+        "64-bit atomics must be lock-free on this platform; "
+        "ARMv7-a requires LDREXD/STREXD support (-march=armv7-a)");
+    static_assert(CacheLineSize > 0 && (CacheLineSize & (CacheLineSize - 1)) == 0,
+        "CacheLineSize must be a power of 2");
+    static_assert(CacheLineSize >= alignof(std::max_align_t),
+        "CacheLineSize must be at least alignof(std::max_align_t)");
 
-    /// Hardware cache line size (typically 64 bytes, auto-detected if available)
 #ifdef __cpp_lib_hardware_interference_size
     static constexpr size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
 #else
-    static constexpr size_t CACHE_LINE_SIZE = 64;
+    static constexpr size_t CACHE_LINE_SIZE = CacheLineSize;
 #endif
 
-    /**
-     * @brief Ring buffer slot metadata
-     * @details Tracks the data index and size for each slot in the ring buffer
-     */
+    static constexpr uint64_t INVALID_INDEX = std::numeric_limits<uint64_t>::max();
+
     struct slot {
-        std::atomic_uint_fast64_t data_index{ std::numeric_limits<uint64_t>::max() };  ///< Absolute index of data in this slot
-        uint32_t size = 1;  ///< Number of consecutive slots occupied
+        std::atomic<uint64_t> data_index{INVALID_INDEX};
     };
+
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> reserved_index_{0};
+    char pad_reserved_[CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>)];
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> consumed_{0};
+    char pad_consumed_[CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>)];
+
+    uint32_t size_;
+    uint32_t mask_;
+    T* buffer_ = nullptr;
+    uintptr_t lower_bound_ = 0;
+    uintptr_t upper_bound_ = 0;
+    T** free_objects_ = nullptr;
+    slot* control_ = nullptr;
 
     /**
-     * @brief Producer reservation information
-     * @details Tracks the current write position and reservation size
+     * @brief 3-tier spin backoff for contention on non-RT systems
+     *
+     * @details
+     * Tier 1 (1-4 spins):   Pure spin - low contention fast path
+     * Tier 2 (5-16 spins):  sched_yield - moderate contention
+     * Tier 3 (17+ spins):   sleep_for(1us) - high contention fallback
+     *
+     * @note On non-RT Linux, sleep_for(1us) may actually sleep 1-10ms
+     *       depending on kernel HZ (100/250/1000). This is acceptable
+     *       as a last-resort backoff after 16 failed spins.
+     *
+     * @param spin_count Reference to per-call-site spin counter
      */
-    struct reserved_info {
-        uint_fast64_t index_ = 0;  ///< Next available write index
-        uint_fast32_t size_ = 0;   ///< Size of current reservation
-    };
-
-    // Cache-line aligned atomics to prevent false sharing
-    alignas(CACHE_LINE_SIZE) std::atomic<reserved_info> reserved_;  ///< Producer reservation counter (own cache line)
-    alignas(CACHE_LINE_SIZE) std::atomic_uint_fast64_t consumed_;   ///< Consumer consumption counter (own cache line)
-
-    // Object storage
-    uint32_t size_;                 ///< Pool capacity (must be power of 2)
-    uint32_t mask_;                 ///< Bitmask for index wrapping (size_ - 1)
-    T* buffer_ = nullptr;           ///< Array of pooled objects
-    intptr_t lower_bound_ = 0;      ///< Lower address bound for pool ownership check
-    intptr_t upper_bound_ = 0;      ///< Upper address bound for pool ownership check
-    T** free_objects_ = nullptr;    ///< Array of pointers to free objects
-    slot* control_ = nullptr;       ///< Ring buffer control slots
+    static void spin_yield(unsigned& spin_count) noexcept {
+        ++spin_count;
+        if (spin_count <= 4) {
+        } else if (spin_count <= 16) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+        }
+    }
 
 public:
     /**
@@ -117,40 +145,54 @@ public:
      *
      * @param size Pool capacity (must be power of 2)
      *
-     * @throws std::runtime_error If size is not a power of 2
+     * @throws std::invalid_argument If size is not a power of 2
      *
      * @post Pool is ready for concurrent allocate/free operations
      *
      * @par Example
      * @code
-     * slick::ObjectPool<MyStruct> pool(256);
+     * slick::ObjectPool<MyStruct, 32> pool(256);
      * @endcode
      */
     ObjectPool(uint32_t size)
         : size_(size)
         , mask_(size - 1)
-        , buffer_(new T[size_])
-        , free_objects_(new T*[size_])
-        , control_(new slot[size_])
     {
-        assert((size && !(size & (size - 1))) && "size must be power of 2");
+        if (size == 0 || (size & (size - 1)) != 0) {
+            throw std::invalid_argument(
+                "ObjectPool size must be a power of 2, got: " + std::to_string(size));
+        }
 
-        // Initialize pool with all objects available
-        uint64_t index;
+        buffer_ = new T[size_];
+        try {
+            free_objects_ = new T*[size_];
+            try {
+                control_ = new slot[size_];
+            } catch (...) {
+                delete[] free_objects_;
+                free_objects_ = nullptr;
+                throw;
+            }
+        } catch (...) {
+            delete[] buffer_;
+            buffer_ = nullptr;
+            throw;
+        }
+
         for (uint32_t i = 0; i < size_; ++i) {
-            index = reserve();
+            auto index = reserve();
             free_objects_[index & mask_] = &buffer_[i];
             publish(index);
         }
 
-        lower_bound_ = reinterpret_cast<intptr_t>(&buffer_[0]);
-        upper_bound_ = reinterpret_cast<intptr_t>(&buffer_[mask_]);
+        lower_bound_ = reinterpret_cast<uintptr_t>(&buffer_[0]);
+        upper_bound_ = reinterpret_cast<uintptr_t>(&buffer_[size_]);
     }
 
     /**
      * @brief Destructor - cleans up all resources
      */
-    virtual ~ObjectPool() noexcept {
+    ~ObjectPool() noexcept {
         delete[] buffer_;
         buffer_ = nullptr;
 
@@ -161,7 +203,6 @@ public:
         control_ = nullptr;
     }
 
-    // Delete copy and move operations
     ObjectPool(const ObjectPool&) = delete;
     ObjectPool& operator=(const ObjectPool&) = delete;
     ObjectPool(ObjectPool&&) = delete;
@@ -171,7 +212,7 @@ public:
      * @brief Get pool capacity
      * @return Maximum number of objects the pool can hold
      */
-    uint32_t size() const noexcept {
+    [[nodiscard]] uint32_t size() const noexcept {
         return size_;
     }
 
@@ -180,13 +221,15 @@ public:
      *
      * @details
      * Returns a pre-allocated object from the pool if available.
-     * If the pool is exhausted, allocates from heap as fallback.
-     * This method is lock-free and thread-safe.
+     * If the pool appears empty, yields the CPU and retries once before
+     * falling back to heap allocation. This retry helps on non-RT Linux
+     * where a producer thread may be preempted between reserve() and
+     * publish(), causing a transient false-empty condition.
      *
      * @return Pointer to allocated object (never nullptr)
      *
      * @note Objects allocated from heap (when pool exhausted) will be
-     *       automatically deleted when returned via free_object()
+     *       automatically deleted when returned via free()
      *
      * @par Thread Safety
      * Safe to call concurrently from multiple threads
@@ -197,14 +240,43 @@ public:
      * obj->value = 42;
      * @endcode
      */
-    T* allocate() {
-        auto [obj, size] = consume();
-        if (!obj) {
-            // Pool exhausted - allocate from heap
-            return new T();
+    [[nodiscard]] T* allocate() {
+        T* obj = consume();
+        if (obj) {
+            return obj;
         }
-        assert(size == 1);
-        return obj;
+        std::this_thread::yield();
+        obj = consume();
+        return obj ? obj : new T();
+    }
+
+    /**
+     * @brief Try to allocate an object from the pool without heap fallback
+     *
+     * @details
+     * Returns a pre-allocated object from the pool if available.
+     * Unlike allocate(), this method returns nullptr when the pool is
+     * exhausted instead of falling back to heap allocation.
+     * Preferred in embedded/real-time systems where heap allocation
+     * is undesirable.
+     *
+     * @return Pointer to allocated object, or nullptr if pool is empty
+     *
+     * @par Thread Safety
+     * Safe to call concurrently from multiple threads
+     *
+     * @par Example
+     * @code
+     * if (auto* obj = pool.try_allocate()) {
+     *     obj->value = 42;
+     *     pool.free(obj);
+     * } else {
+     *     // handle pool exhaustion
+     * }
+     * @endcode
+     */
+    [[nodiscard]] T* try_allocate() noexcept {
+        return consume();
     }
 
     /**
@@ -218,29 +290,25 @@ public:
      * pool by checking its address range. Objects allocated from heap
      * (when pool was exhausted) are automatically deleted.
      *
-     * @param obj Pointer to object to return (must not be nullptr)
+     * @param obj Pointer to object to return
      *
      * @par Thread Safety
      * Safe to call concurrently from multiple threads
      *
-     * @par Example
-     * @code
-     * pool.free_object(obj);  // Returns to pool or deletes
-     * @endcode
-     *
-     * @warning Do not call with nullptr
      * @warning Do not free the same object twice
-     * @warning Do not access object after calling free_object()
+     * @warning Do not access object after calling free()
      */
-    void free(T* obj) {
-        auto o = reinterpret_cast<intptr_t>(obj);
-        if (o >= lower_bound_ && o <= upper_bound_) {
-            // Object belongs to pool - return it
+    void free(T* obj) noexcept {
+        if (!obj) {
+            return;
+        }
+
+        auto o = reinterpret_cast<uintptr_t>(obj);
+        if (o >= lower_bound_ && o < upper_bound_) {
             auto index = reserve();
             free_objects_[index & mask_] = obj;
             publish(index);
         } else {
-            // Object was heap-allocated - delete it
             delete obj;
         }
     }
@@ -262,96 +330,50 @@ public:
      *
      * @note Do not use in production with concurrent access
      */
-    void reset() noexcept {
+    void reset() {
+        auto* new_control = new slot[size_];
         delete[] control_;
-        control_ = new slot[size_];
+        control_ = new_control;
 
-        reserved_.store(reserved_info(), std::memory_order_release);
-        uint64_t index;
+        reserved_index_.store(0, std::memory_order_relaxed);
+        consumed_.store(0, std::memory_order_relaxed);
+
         for (uint32_t i = 0; i < size_; ++i) {
-            index = reserve();
+            auto index = reserve();
             free_objects_[index & mask_] = &buffer_[i];
             publish(index);
         }
-        consumed_.store(0, std::memory_order_release);
     }
 
 private:
     /**
-     * @brief Get the initial reading index
-     * @return Starting index for consumption
-     */
-    uint64_t get_read_index() const noexcept {
-        return consumed_.load(std::memory_order_acquire);
-    }
-
-    /**
      * @brief Reserve space in the ring buffer for writing
      *
      * @details
-     * Atomically reserves n slots in the ring buffer using compare-and-swap.
-     * Handles ring buffer wrapping when reaching the end.
+     * Atomically reserves one slot in the ring buffer using compare-and-swap.
+     * Includes 3-tier backoff (spin/yield/sleep) for contention on non-RT systems.
      *
-     * @param n Number of slots to reserve (default: 1)
-     * @return Starting index of the reserved space
-     *
-     * @throws std::runtime_error If n exceeds pool size
+     * @return Index of the reserved slot
      *
      * @note Lock-free operation using CAS
-     * @note May retry multiple times under high contention
      */
-    uint64_t reserve(uint32_t n = 1) {
-        if (n > size_) [[unlikely]] {
-            throw std::runtime_error("required size " + std::to_string(n) + " > pool size " + std::to_string(size_));
-        }
-        auto reserved = reserved_.load(std::memory_order_relaxed);
-        reserved_info next;
-        uint64_t index;
-        bool buffer_wrapped = false;
+    uint64_t reserve() noexcept {
+        unsigned spin_count = 0;
+        uint64_t current_reserved = reserved_index_.load(std::memory_order_relaxed);
+
         do {
-            buffer_wrapped = false;
-            next = reserved;
-            index = reserved.index_;
-            auto idx = index & mask_;
-            if ((idx + n) > size_) {
-                // Not enough buffer left, wrap to beginning
-                index += size_ - idx;
-                next.index_ = index + n;
-                next.size_ = n;
-                buffer_wrapped = true;
+            uint64_t next_reserved = current_reserved + 1;
+            if (reserved_index_.compare_exchange_weak(
+                    current_reserved, next_reserved,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
             }
-            else {
-                next.index_ += n;
-                next.size_ = n;
-            }
-        } while(!reserved_.compare_exchange_weak(reserved, next, std::memory_order_release, std::memory_order_relaxed));
 
-        if (buffer_wrapped) {
-            // queue wrapped, set current slock.data_index to the reserved index to let the reader
-            // know the next available data is in different slot.
-            auto& slot = control_[reserved.index_ & mask_];
-            slot.size = n;
-            slot.data_index.store(index, std::memory_order_release);
-        }
-        return index;
-    }
+            spin_yield(spin_count);
+        } while (true);
 
-    /**
-     * @brief Access reserved space for writing
-     * @param index Index returned by reserve()
-     * @return Pointer to array position
-     */
-    T** operator[] (uint64_t index) noexcept {
-        return &free_objects_[index & mask_];
-    }
-
-    /**
-     * @brief Access reserved space for writing (const version)
-     * @param index Index returned by reserve()
-     * @return Const pointer to array position
-     */
-    const T** operator[] (uint64_t index) const noexcept {
-        return &free_objects_[index & mask_];
+        return current_reserved;
     }
 
     /**
@@ -362,14 +384,12 @@ private:
      * Must be called after writing to reserved space.
      *
      * @param index Index returned by reserve()
-     * @param n Number of slots to publish (default: 1)
      *
-     * @note Uses release memory ordering for synchronization
+     * @note Uses release memory ordering on data_index for synchronization.
      */
-    void publish(uint64_t index, uint32_t n = 1) noexcept {
-        auto& slot = control_[index & mask_];
-        slot.size = n;
-        slot.data_index.store(index, std::memory_order_release);
+    void publish(uint64_t index) noexcept {
+        auto& s = control_[index & mask_];
+        s.data_index.store(index, std::memory_order_release);
     }
 
     /**
@@ -377,44 +397,37 @@ private:
      *
      * @details
      * Atomically retrieves the next available object from the pool.
-     * Returns {nullptr, 0} if no objects are currently available.
+     * Returns nullptr if no objects are currently available.
+     * Includes 3-tier backoff (spin/yield/sleep) for contention on non-RT systems.
      *
-     * @return Pair of {object_pointer, slot_count}
-     *         Returns {nullptr, 0} if pool is empty
+     * @return Pointer to allocated object, or nullptr if pool is empty
      *
      * @note Lock-free operation using CAS
-     * @note May retry multiple times under high contention
+     * @note Reads free_objects_ BEFORE CAS to prevent data race with
+     *       producers that may reuse the same slot after CAS succeeds.
      */
-    std::pair<T*, uint32_t> consume() noexcept {
+    T* consume() noexcept {
+        unsigned spin_count = 0;
         while (true) {
             uint64_t current_index = consumed_.load(std::memory_order_acquire);
             auto current = current_index & mask_;
             slot* current_slot = &control_[current];
             uint64_t stored_index = current_slot->data_index.load(std::memory_order_acquire);
 
-            if (stored_index != std::numeric_limits<uint64_t>::max() && reserved_.load(std::memory_order_relaxed).index_ < stored_index) [[unlikely]] {
-                // queue has been reset
-                consumed_.store(0, std::memory_order_release);
-                continue;
+            if (stored_index == INVALID_INDEX || stored_index < current_index) {
+                return nullptr;
             }
 
-            if (stored_index == std::numeric_limits<uint64_t>::max() || stored_index < current_index) {
-                // no more data available
-                return std::make_pair(nullptr, 0);
-            }
-            else if (stored_index > current_index && ((stored_index & mask_) != current)) [[unlikely]] {
-                // queue wrapped, skip the unused slots
-                consumed_.compare_exchange_weak(current_index, stored_index, std::memory_order_release, std::memory_order_relaxed);
-                continue;
+            T* obj = free_objects_[current];
+            uint64_t next_index = stored_index + 1;
+
+            if (consumed_.compare_exchange_weak(
+                    current_index, next_index,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                return obj;
             }
 
-            // Try to atomically claim this item
-            uint64_t next_index = stored_index + current_slot->size;
-            if (consumed_.compare_exchange_weak(current_index, next_index, std::memory_order_release, std::memory_order_relaxed)) {
-                // Successfully claimed the item
-                return std::make_pair(free_objects_[current_index & mask_], current_slot->size);
-            }
-            // CAS failed, another consumer claimed it, retry
+            spin_yield(spin_count);
         }
     }
 };
