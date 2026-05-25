@@ -116,7 +116,9 @@ Comprehensive documentation covering:
 
 1. **uint64_t reserve()**
    - Lock-free single-element reservation using CAS
-   - 3-tier backoff for contention
+   - Verifies slot availability (ring buffer not full) before CAS to prevent data corruption
+   - Guards against preempted producers overwriting later data on non-RT Linux
+   - 3-tier backoff for contention and ring-full waiting
    - Returns reserved index
 
 2. **void publish(uint64_t index) noexcept**
@@ -126,6 +128,7 @@ Comprehensive documentation covering:
 3. **T\* consume() noexcept**
    - Lock-free consumption using CAS
    - Reads free_objects_ BEFORE CAS to prevent data race
+   - consumed_ load uses relaxed ordering (data sync through data_index acquire/release)
    - Returns nullptr when pool is empty
    - 3-tier backoff for contention
 

@@ -677,12 +677,115 @@ T* allocate() {
 
 ---
 
+## 第五轮修复
+
+| # | 严重度 | 类别 | 问题 | 状态 |
+|---|--------|------|------|------|
+| 37 | 🔴 Critical | 正确性 | `reserve()` 不检查槽位可用性，被抢占 producer 可覆写后来数据 | ✅ 已修复 |
+| 38 | 🟠 High | ARM 性能 | `consume()` 中 `consumed_.load(acquire)` 无对应 release，多余 DMB | ✅ 已修复 |
+
+---
+
+### 37. 🔴 `reserve()` 不检查槽位可用性，数据丢失竞态条件
+
+**位置**: `object_pool.h:360-377`
+
+**问题**:
+在非RT Linux 下，线程在 `reserve()` 返回索引后、`publish()` 写入 `data_index` 前可能被 CFS 抢占数毫秒甚至更久。在此期间：
+
+1. 其他 producer 继续 `reserve()` + `publish()`，推进 `reserved_index_`
+2. Consumer 继续 `consume()`，推进 `consumed_`
+3. 环形缓冲区绕回（wraparound），被抢占线程的槽位被后来的 producer 覆写
+4. 被抢占线程恢复后将**旧索引值**写入 `data_index`，**覆盖后来 producer 的数据**
+
+具体场景示例（pool size = 4）：
+```
+consumed_ = 5, slot[1] 含未消费的 index=5 数据
+Producer A: reserve → 5, slot=5&3=1 → 被抢占! (未 publish)
+Producer B: reserve → 6, publish(6) → slot[2]=6
+Producer C: reserve → 7, publish(7) → slot[3]=7  
+Producer D: reserve → 8, publish(8) → slot[0]=8
+Producer E: reserve → 9, publish(9) → slot[1]=9  ← 覆写 index=5
+Consumer: 消费 5→6→7→8→9, consumed_=10
+Producer A: 恢复, publish(5) → slot[1]=5  ← 覆盖 index=9 的数据!
+```
+
+此时消费者已越过 index=5，`consumed_=10`。slot[1].data_index=5，消费者永远找不到 index=9 的对象 → **对象泄漏**。
+
+**修复**:
+在 CAS 预约索引**之前**检查环形缓冲区是否已满：
+
+```cpp
+uint64_t reserve() noexcept {
+    unsigned spin_count = 0;
+    while (true) {
+        uint64_t current_reserved = reserved_index_.load(std::memory_order_relaxed);
+        uint64_t c = consumed_.load(std::memory_order_acquire);
+
+        // 环形缓冲区满: 等待消费者推进 consumed_
+        if (current_reserved - c >= size_) {
+            spin_yield(spin_count);
+            continue;
+        }
+
+        uint64_t next_reserved = current_reserved + 1;
+        if (reserved_index_.compare_exchange_weak(
+                current_reserved, next_reserved,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return current_reserved;
+        }
+        spin_yield(spin_count);
+    }
+}
+```
+
+条件 `current_reserved - consumed_ < size_` 确保：
+- 消费者尚未越过此槽位（旧数据已消费）
+- 槽位可以被新数据安全覆写
+
+`consumed_.load(acquire)` 确保 producer 看到消费者的最新进度，防止读取到过期的 `consumed_` 值而误判槽位可用。
+若环形缓冲区满，producer 进入 3 级退避等待消费者释放槽位，不存在死锁风险（消费者始终可以推进 `consumed_`）。
+
+---
+
+### 38. 🟠 `consume()` 中 `consumed_.load(acquire)` 多余 DMB
+
+**位置**: `object_pool.h:421`
+
+**问题**:
+```cpp
+uint64_t current_index = consumed_.load(std::memory_order_acquire);
+```
+
+`consumed_` 的 CAS 写入使用 `memory_order_relaxed`（无 release 语义）。真正的生产者-消费者数据同步通过 `data_index` 的 release/acquire 对完成：
+
+```
+Producer: write free_objects_[idx] → publish(): data_index.store(release)
+Consumer: data_index.load(acquire) → read free_objects_[idx]   ← 同步完成
+```
+
+`consumed_` 只需原子性（CAS 唯一性），不需要内存排序。`memory_order_acquire` 编译为 DMB ISH 指令，在 Cortex-A9 上约 20 cycles (~25ns @800MHz)。在 `allocate()` 热路径中每次多余一次无意义的 DMB。
+
+读取过期的 `consumed_` 值仅导致 CAS 失败重试，不影响正确性。
+
+**修复**:
+改为 `memory_order_relaxed`：
+```cpp
+uint64_t current_index = consumed_.load(std::memory_order_relaxed);
+```
+
+`consume()` 热路径每条减少一条 DMB，对齐原 `reserve()`/`publish()` 中 CAS 的 relaxed 策略。
+
+---
+
 ## 修改文件清单
 
 | 文件 | 修改内容 |
 |------|----------|
-| `include/slick/object_pool.h` | 第一轮 12 项 + 第二轮 11 项 + 第三轮 2 项 + 第四轮 7 项修复 |
+| `include/slick/object_pool.h` | 第一轮 12 项 + 第二轮 11 项 + 第三轮 2 项 + 第四轮 7 项 + 第五轮 2 项修复 |
 | `CMakeLists.txt` | C++ 标准从 20 改为 17 + 版本号 0.1.3→0.2.0 |
 | `README.md` | C++20→17 全面更新 + try_allocate 文档 + 缓存行/内存布局更新 + producer/consumer 术语纠正 |
 | `DOCUMENTATION.md` | 完全重写，与当前代码一致 |
+| `REVIEW.md` | 添加第五轮修复分析记录 |
 | `tests/tests.cpp` | 添加 4 个 try_allocate() 测试用例 + free(nullptr) 测试 |

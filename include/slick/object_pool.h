@@ -351,7 +351,10 @@ private:
      *
      * @details
      * Atomically reserves one slot in the ring buffer using compare-and-swap.
-     * Includes 3-tier backoff (spin/yield/sleep) for contention on non-RT systems.
+     * Before the CAS, verifies slot availability (ring buffer not full) to
+     * prevent data corruption when producer threads are preempted between
+     * reserve() and publish() on non-RT Linux kernels.
+     * Includes 3-tier backoff (spin/yield/sleep) for contention.
      *
      * @return Index of the reserved slot
      *
@@ -359,21 +362,26 @@ private:
      */
     uint64_t reserve() noexcept {
         unsigned spin_count = 0;
-        uint64_t current_reserved = reserved_index_.load(std::memory_order_relaxed);
 
-        do {
+        while (true) {
+            uint64_t current_reserved = reserved_index_.load(std::memory_order_relaxed);
+            uint64_t c = consumed_.load(std::memory_order_acquire);
+
+            if (current_reserved - c >= size_) {
+                spin_yield(spin_count);
+                continue;
+            }
+
             uint64_t next_reserved = current_reserved + 1;
             if (reserved_index_.compare_exchange_weak(
                     current_reserved, next_reserved,
                     std::memory_order_relaxed,
                     std::memory_order_relaxed)) {
-                break;
+                return current_reserved;
             }
 
             spin_yield(spin_count);
-        } while (true);
-
-        return current_reserved;
+        }
     }
 
     /**
@@ -409,7 +417,7 @@ private:
     T* consume() noexcept {
         unsigned spin_count = 0;
         while (true) {
-            uint64_t current_index = consumed_.load(std::memory_order_acquire);
+            uint64_t current_index = consumed_.load(std::memory_order_relaxed);
             auto current = current_index & mask_;
             slot* current_slot = &control_[current];
             uint64_t stored_index = current_slot->data_index.load(std::memory_order_acquire);
