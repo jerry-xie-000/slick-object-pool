@@ -744,7 +744,8 @@ uint64_t reserve() noexcept {
 - 消费者尚未越过此槽位（旧数据已消费）
 - 槽位可以被新数据安全覆写
 
-`consumed_.load(acquire)` 确保 producer 看到消费者的最新进度，防止读取到过期的 `consumed_` 值而误判槽位可用。
+`consumed_.load(acquire)` 在第五轮修复中被添加，目的是确保 producer 看到消费者的最新进度。但经过更深入的分析，`consume()` 的 CAS 写入使用 `memory_order_relaxed`（无 release 语义），因此 `reserve()` 中的 acquire 没有配对的 release，DMB 完全无效。此问题在第六轮审查中发现并修复（见 #39）。
+
 若环形缓冲区满，producer 进入 3 级退避等待消费者释放槽位，不存在死锁风险（消费者始终可以推进 `consumed_`）。
 
 ---
@@ -783,9 +784,115 @@ uint64_t current_index = consumed_.load(std::memory_order_relaxed);
 
 | 文件 | 修改内容 |
 |------|----------|
-| `include/slick/object_pool.h` | 第一轮 12 项 + 第二轮 11 项 + 第三轮 2 项 + 第四轮 7 项 + 第五轮 2 项修复 |
+| `include/slick/object_pool.h` | 第一轮 12 项 + 第二轮 11 项 + 第三轮 2 项 + 第四轮 7 项 + 第五轮 2 项 + 第六轮 1 项修复 |
 | `CMakeLists.txt` | C++ 标准从 20 改为 17 + 版本号 0.1.3→0.2.0 |
 | `README.md` | C++20→17 全面更新 + try_allocate 文档 + 缓存行/内存布局更新 + producer/consumer 术语纠正 |
 | `DOCUMENTATION.md` | 完全重写，与当前代码一致 |
-| `REVIEW.md` | 添加第五轮修复分析记录 |
+| `REVIEW.md` | 添加第五轮 + 第六轮修复分析记录 |
 | `tests/tests.cpp` | 添加 4 个 try_allocate() 测试用例 + free(nullptr) 测试 |
+
+---
+
+## 第六轮修复
+
+| # | 严重度 | 类别 | 问题 | 状态 |
+|---|--------|------|------|------|
+| 39 | 🟠 High | ARM 性能 | `reserve()` 中 `consumed_.load(acquire)` 无配对 release，多余 DMB | ✅ 已修复 |
+
+---
+
+### 39. 🟠 `reserve()` 中 `consumed_.load(acquire)` 无配对 release
+
+**位置**: `object_pool.h:368`
+
+**问题**:
+```cpp
+uint64_t c = consumed_.load(std::memory_order_acquire);
+```
+
+此 `memory_order_acquire` 在第五轮修复 #37 中引入，目的是让 producer 看到消费者的最新进度。但经过完整的同步链路分析，`consume()` 的 CAS 写入使用 `memory_order_relaxed`（无 release 语义），因此 `reserve()` 中的 acquire **没有配对的 release**，产生的 DMB ISH 指令完全无效。
+
+**完整同步链路分析**:
+
+```
+Producer (free()) 路径:
+  1. reserve():  CAS reserved_index_ (relaxed/relaxed)
+  2. 写入 free_objects_[idx & mask_] = obj   ← 非原子写入
+  3. publish():  data_index.store(release)    ← DMB ISH + STR
+
+Consumer (consume()) 路径:
+  1. consumed_.load(relaxed)
+  2. data_index.load(acquire)                 ← LDR + DMB ISH
+  3. 读取 free_objects_[current]              ← 由 acquire 保证可见性
+  4. CAS consumed_ (relaxed/relaxed)          ← 无 release 语义!
+```
+
+核心同步机制是 `data_index` 的 acquire/release 对：
+- Producer: `write free_objects_[idx]` → `data_index.store(release)`
+- Consumer: `data_index.load(acquire)` → `read free_objects_[idx]` ✅ 同步完成
+
+`consumed_` 仅需原子性（CAS 唯一性保证），不需要内存排序。`reserve()` 中的 acquire 试图与一个不存在的 release 配对，DMB 是空操作。
+
+**性能影响**:
+- ARM Cortex-A9: DMB ISH ≈ 20 cycles (~25ns @800MHz)
+- 每次 `free()` 调用多一次无意义 DMB
+- 3000 ops/sec 场景下：75us/秒浪费（虽小但无理由保留）
+
+**正确性分析**:
+使用 `memory_order_relaxed` 后，producer 可能看到过期的 `consumed_` 值（更小），导致 `current_reserved - c >= size_` 更容易为真。这是**保守行为**：
+- 误判缓冲区满 → 额外自旋等待 → 性能略降，但不会数据损坏
+- ARM 缓存一致性协议（MESI/MOESI）保证在纳秒级更新，3000 ops/sec 下影响可忽略
+- CAS 仍保证原子性，唯一索引分配不受影响
+
+**修复**:
+```cpp
+uint64_t c = consumed_.load(std::memory_order_relaxed);
+```
+
+与 `consume()` 中 `consumed_.load(relaxed)` (#38) 和 CAS relaxed 策略 (#30, #31) 保持一致。
+
+---
+
+### 第六轮审查附加观察（未修复，记录备查）
+
+#### 观察 A: `free_objects_` 理论性数据竞争
+
+**位置**: `object_pool.h:429`
+
+**分析**:
+`consume()` 在 CAS 之前读取 `free_objects_[current]`（非原子读取）。当多个消费者竞争同一槽位时：
+
+```
+Consumer A: load consumed_=C, read free_objects_[C&mask_]
+Consumer B: CAS consumed_ C→C+1 (成功)
+Producer:   reserve(C+size_), write free_objects_[(C+size_)&mask_] = new_obj
+            ↑ 即 free_objects_[C&mask_]，与 Consumer A 并发写入!
+Consumer A: CAS 失败 (consumed_ 已变)，丢弃 obj
+```
+
+Producer 写入与 Consumer A 读取并发访问同一 `free_objects_` 槽位，C++ 标准定义为数据竞争（UB）。
+
+**实际影响**: 无。ARM32 上对齐的 4 字节读/写（LDR/STR）硬件保证原子性，Consumer A 看到旧值或新值均为合法 `T*`，且 CAS 失败后值被丢弃。
+
+**潜在修复**: 将 `free_objects_` 改为 `std::atomic<T*>*`，使用 `load(relaxed)` / `store(relaxed)`。ARM 上编译结果相同（LDR/STR），但消除标准层面的 UB。代码改动量中等，当前场景下无实际收益。
+
+#### 观察 B: `free_objects_` 与 `control_` 分离数组影响缓存局部性
+
+**分析**:
+当前 `consume()` 每次操作需访问两个数组：
+1. `control_[current].data_index` (acquire) → 可能触发 cache miss
+2. `free_objects_[current]` → 可能触发另一次 cache miss（不同缓存行）
+
+若合并为单一结构体：
+```cpp
+struct entry {
+    std::atomic<uint64_t> data_index{INVALID_INDEX};
+    T* obj{nullptr};  // 或 std::atomic<T*>
+};
+```
+
+ARM32 上每个 entry 16 字节，32 字节缓存行可容纳 2 个 entry。Consumer 只需 1 次缓存行访问（data_index 和 obj 在同一缓存行）。
+
+**实际影响**: 3000 ops/sec 下每次操作 ~333us，一次 L2 cache miss ~50ns，占比 < 0.02%。非关键路径优化，但高吞吐场景（>100K ops/sec）下收益显著。
+
+**不修复原因**: 需要大幅重构代码（reserve/publish/consume/free/构造/析构/reset 全部涉及），当前使用场景下收益不足以 justify 风险。

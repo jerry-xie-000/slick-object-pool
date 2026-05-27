@@ -365,7 +365,7 @@ private:
 
         while (true) {
             uint64_t current_reserved = reserved_index_.load(std::memory_order_relaxed);
-            uint64_t c = consumed_.load(std::memory_order_acquire);
+            uint64_t c = consumed_.load(std::memory_order_relaxed);
 
             if (current_reserved - c >= size_) {
                 spin_yield(spin_count);
