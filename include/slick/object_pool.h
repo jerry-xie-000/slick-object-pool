@@ -85,11 +85,22 @@ class ObjectPool {
     static_assert(CacheLineSize >= alignof(std::max_align_t),
         "CacheLineSize must be at least alignof(std::max_align_t)");
 
-#ifdef __cpp_lib_hardware_interference_size
-    static constexpr size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
+// 根据目标平台选择固定值
+#if defined(__arm__) || defined(__aarch64__)
+// ARM 架构通常 32 或 64 字节
+#if defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7R__)
+        static constexpr size_t CACHE_LINE_SIZE = 32;   // Cortex-A9 等
 #else
-    static constexpr size_t CACHE_LINE_SIZE = CacheLineSize;
+        static constexpr size_t CACHE_LINE_SIZE = 64;   // 较新的 ARM
 #endif
+#elif defined(__x86_64__) || defined(__i386__)
+        static constexpr size_t CACHE_LINE_SIZE = 64;   // x86 架构
+#elif defined(__powerpc__)
+        static constexpr size_t CACHE_LINE_SIZE = 128;   // PowerPC
+#else
+        static constexpr size_t CACHE_LINE_SIZE = 64;   // 默认值
+#endif
+#pragma message("CACHE_LINE_SIZE is set to " #CACHE_LINE_SIZE) 
 
     static constexpr uint64_t INVALID_INDEX = std::numeric_limits<uint64_t>::max();
 
